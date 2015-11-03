@@ -23,6 +23,7 @@ import Queue
 from proxy_tools import proxy
 
 from cloudify import context
+from cloudify.context import SecurityContext
 from cloudify.manager import (get_node_instance,
                               update_node_instance,
                               update_execution_status,
@@ -411,6 +412,8 @@ class _WorkflowContextBase(object):
 
     def __init__(self, ctx, remote_ctx_handler_cls):
         self._context = ctx = ctx or {}
+        security_ctx_dict = self._context.get('security_ctx', {})
+        self._security_ctx = SecurityContext(security_ctx_dict)
         self._local_task_thread_pool_size = ctx.get(
             'local_task_thread_pool_size',
             DEFAULT_LOCAL_TASK_THREAD_POOL_SIZE)
@@ -568,7 +571,6 @@ class _WorkflowContextBase(object):
         final_kwargs = self._merge_dicts(merged_from=kwargs,
                                          merged_into=operation_properties,
                                          allow_override=allow_kwargs_override)
-
         return self.execute_task(task_name,
                                  local=self.local,
                                  kwargs=final_kwargs,
@@ -615,6 +617,7 @@ class _WorkflowContextBase(object):
             'task_name': task_name,
             'execution_id': self.execution_id,
             'workflow_id': self.workflow_id,
+            'security_context': self._security_ctx
         }
         context.update(node_context)
         context.update(self.internal.handler.operation_cloudify_context)
@@ -827,6 +830,8 @@ class CloudifyWorkflowContext(
 
         self.blueprint = context.BlueprintContext(self._context)
         self.deployment = WorkflowDeploymentContext(self._context, self)
+        security_ctx_dict = self._context.get('security_ctx', {})
+        self._security_ctx = context.SecurityContext(security_ctx_dict)
 
         if self.local:
             storage = self.internal.handler.storage
