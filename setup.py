@@ -47,6 +47,9 @@ setup(
               'cloudify.celery',
               'cloudify.proxy',
               'cloudify.test_utils'],
+    package_data={
+        'cloudify/resources': ['default_lifecycle.yaml']
+    },
     license='LICENSE',
     description='Contains necessary decorators and utility methods for '
                 'writing Cloudify plugins',
