@@ -107,7 +107,6 @@ def scale(ctx, node_id, delta, scale_compute, **kwargs):
         raise ValueError('Provided delta: {0} is illegal. current number of'
                          'instances of node {1} is {2}'
                          .format(delta, node_id, curr_num_instances))
-
     modification = ctx.deployment.start_modification({
         scaled_node.id: {
             'instances': planned_num_instances
@@ -351,3 +350,17 @@ def execute_operation(ctx, operation, operation_kwargs, allow_kwargs_override,
                                      subgraphs[rel.target_id])
 
     graph.execute()
+
+
+@workflow
+def update(ctx, added_instance_ids, related_instance_ids, **kwargs):
+    added_instances = [i for i in ctx.node_instances if
+                       i.id in added_instance_ids]
+
+    related_instances = [i for i in ctx.node_instances if
+                         i.id in related_instance_ids]
+
+    lifecycle.install_node_instances(
+        graph=ctx.graph_mode(),
+        node_instances=set(added_instances),
+        intact_nodes=set(related_instances))
