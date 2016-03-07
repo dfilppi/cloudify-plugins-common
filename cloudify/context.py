@@ -99,7 +99,14 @@ class CommonContext(object):
         self.deployment = DeploymentContext(self._context)
         self.security_context = self._context.get('security_context', None)
         if not self.security_context:
-            self.security_context = SecurityContext()
+            self.security_context = SecurityContext().to_dict()
+            with open('/tmp/context1.log', 'a') as wf_log:
+                wf_log.write('self.security_context: {0}, type: {1}\n'.format(
+                    self.security_context, type(self.security_context)))
+        else:
+            with open('/tmp/context2.log', 'a') as wf_log:
+                wf_log.write('self.security_context: {0}, type: {1}\n'.format(
+                    self.security_context, type(self.security_context)))
 
 
 class BootstrapContext(object):
@@ -286,14 +293,19 @@ class DeploymentContext(EntityContext):
 class SecurityContext(object):
 
     def __init__(self, security_context=None):
-        self._security_context = security_context
-        if not security_context:
-            self._security_context = {}
-        # self.is_security_enabled = security_enabled
-        # self.is_ssl_enabled = ssl_enabled
-        # self.verify_certificate = verify_ssl_certificate
-        # self.cloudify_username = cloudify_username
-        # self.cloudify_password = cloudify_password
+        if security_context:
+            self._security_context = security_context
+        else:
+            self._security_context = {
+                'security_enabled': False,
+                'ssl_enabled': False,
+                'verify_ssl_certificate': False,
+                'cloudify_username': '',
+                'cloudify_password': ''
+            }
+
+    def to_dict(self):
+        return self._security_context
 
     @property
     def security_enabled(self):

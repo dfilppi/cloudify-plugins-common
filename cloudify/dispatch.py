@@ -109,9 +109,17 @@ class TaskHandler(object):
         # loggers
         output = open(os.path.join(dispatch_dir, 'output'), 'w')
         try:
+            with open('/tmp/dispatch.log', 'a') as dispatch_log:
+                dispatch_log.write('type(self.cloudify_context): {0}\n'.format(type(self.cloudify_context)))
+                dispatch_log.write('type(self.cloudify_context[security_context]): {0}\n'.
+                                   format(type(self.cloudify_context['security_context'])))
+                dispatch_log.write('self.cloudify_context: {0}\n'.format(self.cloudify_context))
+                dispatch_log.write('self.args: {0}\n'.format(self.args))
+                dispatch_log.write('self.kwargs: {0}\n'.format(self.kwargs))
             with open(os.path.join(dispatch_dir, 'input.json'), 'w') as f:
                 json.dump({
                     'cloudify_context': self.cloudify_context,
+                    # 'security_context': self.cloudify_context['security_context'],
                     'args': self.args,
                     'kwargs': self.kwargs
                 }, f)

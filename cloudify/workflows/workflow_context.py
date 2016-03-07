@@ -412,8 +412,12 @@ class _WorkflowContextBase(object):
 
     def __init__(self, ctx, remote_ctx_handler_cls):
         self._context = ctx = ctx or {}
-        security_ctx_dict = self._context.get('security_ctx', {})
-        self._security_ctx = SecurityContext(security_ctx_dict)
+        self._security_context = self._context.get('security_context', {})
+        # security_ctx_dict = self._context.get('security_ctx', {})
+        # self._security_ctx = SecurityContext(security_ctx_dict)
+        with open('/tmp/wf1.log', 'a') as wf_log:
+            wf_log.write('self._security_context: {0}, type: {1}\n'.format(
+                self._security_context, type(self._security_context)))
         self._local_task_thread_pool_size = ctx.get(
             'local_task_thread_pool_size',
             DEFAULT_LOCAL_TASK_THREAD_POOL_SIZE)
@@ -617,7 +621,7 @@ class _WorkflowContextBase(object):
             'task_name': task_name,
             'execution_id': self.execution_id,
             'workflow_id': self.workflow_id,
-            'security_context': self._security_ctx
+            'security_context': self._security_context
         }
         context.update(node_context)
         context.update(self.internal.handler.operation_cloudify_context)
@@ -830,8 +834,12 @@ class CloudifyWorkflowContext(
 
         self.blueprint = context.BlueprintContext(self._context)
         self.deployment = WorkflowDeploymentContext(self._context, self)
-        security_ctx_dict = self._context.get('security_ctx', {})
-        self._security_ctx = context.SecurityContext(security_ctx_dict)
+        self._security_context = self._context.get('security_context', {})
+        # security_ctx_dict = self._context.get('security_ctx', {})
+        # self._security_ctx = context.SecurityContext(security_ctx_dict)
+        with open('/tmp/wf2.log', 'a') as wf_log:
+            wf_log.write('self._security_context: {0}, type: {1}\n'.format(
+                self._security_context, type(self._security_context)))
 
         if self.local:
             storage = self.internal.handler.storage
