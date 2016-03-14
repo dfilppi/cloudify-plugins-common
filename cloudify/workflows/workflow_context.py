@@ -575,6 +575,7 @@ class _WorkflowContextBase(object):
         final_kwargs = self._merge_dicts(merged_from=kwargs,
                                          merged_into=operation_properties,
                                          allow_override=allow_kwargs_override)
+
         return self.execute_task(task_name,
                                  local=self.local,
                                  kwargs=final_kwargs,
