@@ -5,6 +5,25 @@ import json
 import shlex
 
 
+def check_output(*popenargs, **kwargs):
+    r"""Run command with arguments and return its output as a byte string.
+    Backported from Python 2.7 as it's implemented as pure python on stdlib.
+    >>> check_output(['/usr/bin/python', '--version'])
+    Python 2.6.2
+    """
+    process = subprocess.Popen(stdout=subprocess.PIPE, *popenargs, **kwargs)
+    output, unused_err = process.communicate()
+    retcode = process.poll()
+    if retcode:
+        cmd = kwargs.get("args")
+        if cmd is None:
+            cmd = popenargs[0]
+        error = subprocess.CalledProcessError(retcode, cmd)
+        error.output = output
+        raise error
+    return output
+
+
 def unicode_to_string(text):
     if isinstance(text, unicode):
         return text.encode('ascii', 'ignore')
@@ -19,7 +38,7 @@ def unicode_to_string(text):
 class CtxLogger(object):
     def _logger(self, message, level):
         cmd = ['ctx', 'logger', level, message]
-        return subprocess.check_output(cmd)
+        return check_output(cmd)
 
     def debug(self, message):
         return self._logger(level='debug', message=message)
@@ -43,7 +62,7 @@ class CtxNodeProperties(object):
         cmd = ['ctx', '-j', 'node', 'properties', property_name]
         if self.relationship_type:
             cmd.insert(2, self.relationship_type)
-        result = json.loads(subprocess.check_output(cmd))
+        result = json.loads(check_output(cmd))
         return unicode_to_string(result)
 
     def get(self, property_name, returns=None):
@@ -59,7 +78,7 @@ class CtxNode(object):
 
     def _node(self, prop):
         cmd = ['ctx', '-j', 'node', prop]
-        result = json.loads(subprocess.check_output(cmd))
+        result = json.loads(check_output(cmd))
         return unicode_to_string(result)
 
     @property
@@ -87,7 +106,7 @@ class CtxInstanceRuntimeProperties(object):
         cmd = ['ctx', '-j', 'instance', 'runtime_properties', property_name]
         if self.relationship_type:
             cmd.insert(2, self.relationship_type)
-        result = json.loads(subprocess.check_output(cmd))
+        result = json.loads(check_output(cmd))
         return unicode_to_string(result)
 
     def get(self, property_name, returns=None):
@@ -99,7 +118,7 @@ class CtxInstanceRuntimeProperties(object):
                else '@"{0}"'.format(value)]
         if self.relationship_type:
             cmd.insert(1, self.relationship_type)
-        return subprocess.check_output(cmd)
+        return check_output(cmd)
 
 
 class CtxNodeInstance(object):
@@ -110,7 +129,7 @@ class CtxNodeInstance(object):
         cmd = ['ctx', '-j', 'instance', prop]
         if self.relationship_type:
             cmd.insert(2, self.relationship_type)
-        result = json.loads(subprocess.check_output(cmd))
+        result = json.loads(check_output(cmd))
         return unicode_to_string(result)
 
     @property
@@ -154,7 +173,7 @@ class Ctx(object):
     def __call__(self, command_ref):
         ctx_command = shlex.split(command_ref)
         ctx_command.insert(0, 'ctx')
-        return subprocess.check_output(ctx_command)
+        return check_output(ctx_command)
 
     @property
     def node(self):
@@ -178,14 +197,14 @@ class Ctx(object):
 
     def returns(self, data):
         cmd = ['ctx', '-j', 'returns', str(data)]
-        return json.loads(subprocess.check_output(cmd))
+        return json.loads(check_output(cmd))
 
     # TODO: support kwargs for both download_resource and ..render
     def download_resource(self, source, destination=''):
         cmd = ['ctx', 'download-resource', source]
         if destination:
             cmd.append(destination)
-        return subprocess.check_output(cmd)
+        return check_output(cmd)
 
     def download_resource_and_render(self, source, destination='',
                                      params=None):
@@ -196,7 +215,7 @@ class Ctx(object):
             if not isinstance(params, dict):
                 raise
             cmd.append(params)
-        return subprocess.check_output(cmd)
+        return check_output(cmd)
 
 
 ctx = Ctx()
