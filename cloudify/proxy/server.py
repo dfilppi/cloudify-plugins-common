@@ -190,6 +190,7 @@ class StubCtxProxy(object):
 
 
 def process_ctx_request(ctx, args):
+    pattern = re.compile("(.+)\[(\d+)\]")
     current = ctx
     num_args = len(args)
     index = 0
@@ -220,6 +221,13 @@ def process_ctx_request(ctx, args):
                 remaining_args = remaining_args[:-1]
             current = current(*remaining_args, **kwargs)
             break
+        # Detect list
+        elif pattern.match(arg):
+          m=pattern.match(arg)
+          field=m.group(1)
+          indx=int(m.group(2))
+          current=getattr(current,field)[indx]
+
         else:
             raise RuntimeError('{0} cannot be processed in {1}'
                                .format(arg, args))
