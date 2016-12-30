@@ -14,9 +14,11 @@
 #    * limitations under the License.
 
 import os
-import urllib2
+
+import requests
 
 import utils
+import constants
 from cloudify_rest_client import CloudifyClient
 from cloudify.exceptions import HttpException, NonRecoverableError
 
@@ -72,6 +74,14 @@ class NodeInstance(object):
         """
         return self._runtime_properties
 
+    @runtime_properties.setter
+    def runtime_properties(self, new_properties):
+        # notify the old object of the changes - trigger a .modifiable check
+        self._runtime_properties._set_changed()
+
+        self._runtime_properties = DirtyTrackingDict(new_properties)
+        self._runtime_properties._set_changed()
+
     @property
     def version(self):
         return self._version
@@ -112,21 +122,53 @@ def get_rest_client():
     :returns: A REST client configured to connect to the manager in context
     :rtype: cloudify_rest_client.CloudifyClient
     """
-    return CloudifyClient(utils.get_manager_ip(),
-                          utils.get_manager_rest_service_port())
+    rest_host = utils.get_manager_rest_service_host()
+    rest_port = utils.get_manager_rest_service_port()
+    rest_protocol = constants.DEFAULT_PROTOCOL
+
+    # handle maintenance mode
+    headers = {}
+    if utils.get_is_bypass_maintenance():
+        headers['X-BYPASS-MAINTENANCE'] = 'True'
+
+    # handle security
+    if not utils.is_security_enabled():
+        rest_client = CloudifyClient(rest_host,
+                                     rest_port,
+                                     rest_protocol,
+                                     headers=headers)
+    else:
+        # security enabled
+        token = utils.get_rest_token()
+        headers.update({constants.CLOUDIFY_TOKEN_AUTHENTICATION_HEADER: token})
+        rest_port = utils.get_manager_rest_service_port()
+        rest_protocol = utils.get_manager_rest_service_protocol()
+
+        if utils.is_verify_rest_certificate():
+            trust_all = False
+            cert_path = utils.get_local_rest_certificate()
+        else:
+            trust_all = True
+            cert_path = None
+
+        rest_client = CloudifyClient(host=rest_host, port=rest_port,
+                                     protocol=rest_protocol, headers=headers,
+                                     cert=cert_path, trust_all=trust_all)
+
+    return rest_client
 
 
 def _save_resource(logger, resource, resource_path, target_path):
     if not target_path:
         target_path = os.path.join(utils.create_temp_folder(),
                                    os.path.basename(resource_path))
-    with open(target_path, 'w') as f:
+    with open(target_path, 'wb') as f:
         f.write(resource)
     logger.info("Downloaded %s to %s" % (resource_path, target_path))
     return target_path
 
 
-def download_resource(resource_path, logger, target_path=None):
+def download_resource_from_manager(resource_path, logger, target_path=None):
     """
     Download resource from the manager file server.
 
@@ -135,30 +177,41 @@ def download_resource(resource_path, logger, target_path=None):
     :param target_path: optional target path for the resource
     :returns: path to the downloaded resource
     """
-    resource = get_resource(resource_path)
+    resource = get_resource_from_manager(resource_path)
     return _save_resource(logger, resource, resource_path, target_path)
 
 
-def download_blueprint_resource(blueprint_id,
-                                resource_path,
-                                logger,
-                                target_path=None):
+def download_resource(blueprint_id,
+                      deployment_id,
+                      resource_path,
+                      logger,
+                      target_path=None):
     """
     Download resource from the manager file server with path relative to
-    the blueprint denoted by ``blueprint_id``.
+    the deployment or blueprint denoted by ``deployment_id`` or
+    ``blueprint_id``
+
+    An attempt will first be made for getting the resource from the deployment
+    folder. If not found, an attempt will be made for getting the resource
+    from the blueprint folder.
 
     :param blueprint_id: the blueprint id of the blueprint to download the
                          resource from
-    :param resource_path: path to resource relative to blueprint folder
+    :param deployment_id: the deployment id of the deployment to download the
+                          resource from
+    :param resource_path: path to resource relative to blueprint or deployment
+                          folder
     :param logger: logger to use for info output
     :param target_path: optional target path for the resource
     :returns: path to the downloaded resource
     """
-    resource = get_blueprint_resource(blueprint_id, resource_path)
+    resource = get_resource(blueprint_id,
+                            deployment_id,
+                            resource_path)
     return _save_resource(logger, resource, resource_path, target_path)
 
 
-def get_resource(resource_path, base_url=None):
+def get_resource_from_manager(resource_path, base_url=None):
     """
     Get resource from the manager file server.
 
@@ -167,28 +220,65 @@ def get_resource(resource_path, base_url=None):
     """
     if base_url is None:
         base_url = utils.get_manager_file_server_url()
-    try:
-        url = '{0}/{1}'.format(base_url, resource_path)
-        response = urllib2.urlopen(url)
-        return response.read()
-    except urllib2.HTTPError as e:
-        raise HttpException(e.url, e.code, e.msg)
+
+    url = '{0}/{1}'.format(base_url, resource_path)
+    if utils.is_verify_rest_certificate():
+        verify = utils.get_local_rest_certificate() or True
+    else:
+        verify = False
+
+    response = requests.get(url, verify=verify)
+    if not response.ok:
+        raise HttpException(url, response.status_code, response.reason)
+    return response.content
 
 
-def get_blueprint_resource(blueprint_id, resource_path):
+def get_resource(blueprint_id, deployment_id, resource_path):
     """
-    Get resource from the manager file server with patch relative to
-    the blueprint denoted by ``blueprint_id``.
+    Get resource from the manager file server with path relative to
+    the deployment or blueprint denoted by ``deployment_id`` or
+    ``blueprint_id``.
+
+    An attempt will first be made for getting the resource from the deployment
+    folder. If not found, an attempt will be made for getting the resource
+    from the blueprint folder.
 
     :param blueprint_id: the blueprint id of the blueprint to download
                          the resource from
+    :param deployment_id: the deployment id of the deployment to download the
+                          resource from
     :param resource_path: path to resource relative to blueprint folder
     :returns: resource content
     """
-    base_url = "{0}/{1}".format(utils
-                                .get_manager_file_server_blueprints_root_url(),
-                                blueprint_id)
-    return get_resource(resource_path, base_url=base_url)
+
+    def _get_resource(base_url):
+        try:
+            return get_resource_from_manager(resource_path, base_url=base_url)
+        except HttpException as e:
+            if e.code != 404:
+                raise
+            return None
+
+    resource = None
+    if deployment_id is not None:
+        deployment_base_url = '{0}/{1}'.format(
+            utils.get_manager_file_server_deployments_root_url(),
+            deployment_id)
+        resource = _get_resource(deployment_base_url)
+
+    if resource is None:
+        blueprint_base_url = '{0}/{1}'.format(
+                utils.get_manager_file_server_blueprints_root_url(),
+                blueprint_id)
+        resource = _get_resource(blueprint_base_url)
+        if resource is None:
+            if deployment_id is None:
+                url = blueprint_base_url
+            else:
+                url = ','.join([deployment_base_url, blueprint_base_url])
+            raise HttpException(url, 404, 'Resource not found: {0}'
+                                .format(resource_path))
+    return resource
 
 
 def get_node_instance(node_instance_id):

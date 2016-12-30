@@ -22,12 +22,15 @@ import string
 import subprocess
 import sys
 import tempfile
+import traceback
+import StringIO
 
 from cloudify import constants
 from cloudify.exceptions import (
     CommandExecutionException,
     NonRecoverableError,
 )
+from cloudify.state import workflow_ctx, ctx
 
 
 class ManagerVersion(object):
@@ -62,6 +65,24 @@ class ManagerVersion(object):
 
     def __str__(self):
         return '{0}.{1}.{2}'.format(self.major, self.minor, self.service)
+
+    def __eq__(self, other):
+        return self.equals(other)
+
+    def __gt__(self, other):
+        return self.greater_than(other)
+
+    def __lt__(self, other):
+        return other > self
+
+    def __ge__(self, other):
+        return self > other or self == other
+
+    def __le__(self, other):
+        return self < other or self == other
+
+    def __ne__(self, other):
+        return self > other or self < other
 
 
 def setup_logger(logger_name,
@@ -109,11 +130,25 @@ def setup_logger(logger_name,
     return logger
 
 
-def get_manager_ip():
+def get_manager_file_server_host():
     """
-    Returns the IP address of manager inside the management network.
+    Returns the host the manager file server is running on.
     """
-    return os.environ[constants.MANAGER_IP_KEY]
+    return os.environ[constants.FILE_SERVER_HOST_KEY]
+
+
+def get_manager_file_server_port():
+    """
+    Returns the port the manager file server is running on.
+    """
+    return int(os.environ[constants.FILE_SERVER_PORT_KEY])
+
+
+def get_manager_file_server_protocol():
+    """
+    Returns the protocol of the manager file server
+    """
+    return os.environ[constants.FILE_SERVER_PROTOCOL_KEY]
 
 
 def get_manager_file_server_blueprints_root_url():
@@ -123,6 +158,13 @@ def get_manager_file_server_blueprints_root_url():
     return os.environ[constants.MANAGER_FILE_SERVER_BLUEPRINTS_ROOT_URL_KEY]
 
 
+def get_manager_file_server_deployments_root_url():
+    """
+    Returns the blueprints root url in the file server.
+    """
+    return os.environ[constants.MANAGER_FILE_SERVER_DEPLOYMENTS_ROOT_URL_KEY]
+
+
 def get_manager_file_server_url():
     """
     Returns the manager file server base url.
@@ -130,11 +172,103 @@ def get_manager_file_server_url():
     return os.environ[constants.MANAGER_FILE_SERVER_URL_KEY]
 
 
+def is_security_enabled():
+    """
+    Returns True if REST security is enabled, False otherwise
+    """
+    return os.environ[constants.SECURITY_ENABLED_KEY].lower() == 'true'
+
+
+def is_ssl_enabled():
+    """
+    Returns True if SSL is enabled, False otherwise
+    """
+    return os.environ[constants.SSL_ENABLED_KEY].lower() == 'true'
+
+
+def get_manager_rest_service_host():
+    """
+    Returns the host the manager REST service is running on.
+    """
+    return os.environ[constants.REST_HOST_KEY]
+
+
+def get_agent_rest_cert_path():
+    """
+    Returns location of the rest certificate on the agent
+    """
+    return os.environ[constants.AGENT_REST_CERT_PATH]
+
+
+def get_broker_ssl_cert_path():
+    """
+    Returns location of the broker certificate on the agent
+    """
+    return os.environ[constants.BROKER_SSL_CERT_PATH]
+
+
+# maintained for backwards compatibility
+get_manager_ip = get_manager_rest_service_host
+
+
 def get_manager_rest_service_port():
     """
     Returns the port the manager REST service is running on.
     """
-    return int(os.environ[constants.MANAGER_REST_PORT_KEY])
+    return int(os.environ[constants.REST_PORT_KEY])
+
+
+def get_manager_rest_service_protocol():
+    """
+    Returns the protocol the manager REST service is running on.
+    """
+    return os.environ[constants.REST_PROTOCOL_KEY]
+
+
+def is_verify_rest_certificate():
+    """
+    Returns True if the rest client should verify the server's SSL
+     certificate, False otherwise.
+    """
+    return os.environ[constants.VERIFY_REST_CERTIFICATE_KEY].lower() == 'true'
+
+
+def get_local_rest_certificate():
+    """
+    Returns the path to the local copy of the server's public certificate
+    """
+    return os.environ[constants.LOCAL_REST_CERT_FILE_KEY]
+
+
+def get_rest_cert_content():
+    """
+    Returns the content of the REST SSL certificate
+    """
+    return os.environ[constants.REST_CERT_CONTENT_KEY]
+
+
+def _get_current_context():
+    for context in [ctx, workflow_ctx]:
+        try:
+            return context._get_current_object()
+        except RuntimeError:
+            continue
+    raise RuntimeError('Context required, but no operation or workflow '
+                       'context available.')
+
+
+def get_rest_token():
+    """
+    Returns the auth token to use when calling the REST service
+    """
+    return _get_current_context().rest_token
+
+
+def get_is_bypass_maintenance():
+    """
+    Returns true if workflow should run in maintenance mode.
+    """
+    return os.environ.get(constants.BYPASS_MAINTENANCE, '').lower() == 'true'
 
 
 def id_generator(size=6, chars=string.ascii_uppercase + string.digits):
@@ -151,6 +285,17 @@ def create_temp_folder():
     path_join = os.path.join(tempfile.gettempdir(), id_generator(5))
     os.makedirs(path_join)
     return path_join
+
+
+def exception_to_error_cause(exception, tb):
+    error = StringIO.StringIO()
+    etype = type(exception)
+    traceback.print_exception(etype, exception, tb, file=error)
+    return {
+        'message': str(exception),
+        'traceback': error.getvalue(),
+        'type': etype.__name__
+    }
 
 
 class LocalCommandRunner(object):
@@ -236,6 +381,7 @@ class CommandExecutionResponse(object):
         self.std_out = std_out
         self.std_err = std_err
         self.return_code = return_code
+
 
 setup_default_logger = setup_logger  # deprecated; for backwards compatibility
 

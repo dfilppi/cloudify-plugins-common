@@ -28,7 +28,7 @@ from cloudify.manager import (get_node_instance,
                               update_execution_status,
                               get_bootstrap_context,
                               get_rest_client,
-                              download_blueprint_resource)
+                              download_resource)
 from cloudify.workflows.tasks import (RemoteWorkflowTask,
                                       LocalWorkflowTask,
                                       NOPLocalWorkflowTask,
@@ -36,7 +36,9 @@ from cloudify.workflows.tasks import (RemoteWorkflowTask,
                                       DEFAULT_RETRY_INTERVAL,
                                       DEFAULT_SEND_TASK_EVENTS,
                                       DEFAULT_SUBGRAPH_TOTAL_RETRIES)
+from cloudify import utils
 from cloudify import exceptions
+from cloudify.state import current_workflow_ctx
 from cloudify.workflows import events
 from cloudify.workflows.tasks_graph import TaskDependencyGraph
 from cloudify.amqp_client_utils import AMQPWrappedThread
@@ -48,6 +50,11 @@ from cloudify.logs import (CloudifyWorkflowLoggingHandler,
                            send_workflow_event,
                            send_sys_wide_wf_event,
                            send_workflow_node_event)
+
+try:
+    from collections import OrderedDict
+except ImportError:
+    from ordereddict import OrderedDict
 
 
 DEFAULT_LOCAL_TASK_THREAD_POOL_SIZE = 1
@@ -192,7 +199,7 @@ class CloudifyWorkflowNodeInstance(object):
         self._node_instance = node_instance
         # Directly contained node instances. Filled in the context's __init__()
         self._contained_instances = []
-        self._relationship_instances = dict(
+        self._relationship_instances = OrderedDict(
             (relationship_instance['target_id'],
                 CloudifyWorkflowRelationshipInstance(
                     self.ctx, self, nodes_and_instances,
@@ -290,6 +297,10 @@ class CloudifyWorkflowNodeInstance(object):
         return self._node_instance.get('modification')
 
     @property
+    def scaling_groups(self):
+        return self._node_instance.get('scaling_groups', [])
+
+    @property
     def logger(self):
         """A logger for this workflow node"""
         if self._logger is None:
@@ -335,7 +346,7 @@ class CloudifyWorkflowNode(object):
     def __init__(self, ctx, node, nodes_and_instances):
         self.ctx = ctx
         self._node = node
-        self._relationships = dict(
+        self._relationships = OrderedDict(
             (relationship['target_id'], CloudifyWorkflowRelationship(
                 self.ctx, self, nodes_and_instances, relationship))
             for relationship in node.relationships)
@@ -414,7 +425,6 @@ class _WorkflowContextBase(object):
         self._local_task_thread_pool_size = ctx.get(
             'local_task_thread_pool_size',
             DEFAULT_LOCAL_TASK_THREAD_POOL_SIZE)
-
         self._task_retry_interval = ctx.get('task_retry_interval',
                                             DEFAULT_RETRY_INTERVAL)
         self._task_retries = ctx.get('task_retries',
@@ -461,6 +471,11 @@ class _WorkflowContextBase(object):
     def workflow_id(self):
         """The workflow id"""
         return self._context.get('workflow_id')
+
+    @property
+    def rest_token(self):
+        """REST service token"""
+        return self._context.get('rest_token')
 
     @property
     def local(self):
@@ -614,7 +629,7 @@ class _WorkflowContextBase(object):
             'task_id': task_id,
             'task_name': task_name,
             'execution_id': self.execution_id,
-            'workflow_id': self.workflow_id,
+            'workflow_id': self.workflow_id
         }
         context.update(node_context)
         context.update(self.internal.handler.operation_cloudify_context)
@@ -818,27 +833,29 @@ class CloudifyWorkflowContext(
     """
 
     def __init__(self, ctx):
-        # Not using super() here, because WorkflowNodesAndInstancesContainer's
-        # __init__() needs some data to be prepared before calling it. It would
-        # be possible to overcome this by using kwargs + super(...).__init__()
-        # in _WorkflowContextBase, but the way it is now is self-explanatory.
-        _WorkflowContextBase.__init__(self, ctx,
-                                      RemoteCloudifyWorkflowContextHandler)
+        with current_workflow_ctx.push(self):
+            # Not using super() here, because
+            # WorkflowNodesAndInstancesContainer's __init__() needs some data
+            # to be prepared before calling it. It would be possible to
+            # overcome this by using kwargs + super(...).__init__() in
+            # _WorkflowContextBase, but the way it is now is self-explanatory.
+            _WorkflowContextBase.__init__(self, ctx,
+                                          RemoteCloudifyWorkflowContextHandler)
+            self.blueprint = context.BlueprintContext(self._context)
+            self.deployment = WorkflowDeploymentContext(self._context, self)
 
-        self.blueprint = context.BlueprintContext(self._context)
-        self.deployment = WorkflowDeploymentContext(self._context, self)
+            if self.local:
+                storage = self.internal.handler.storage
+                raw_nodes = storage.get_nodes()
+                raw_node_instances = storage.get_node_instances()
+            else:
+                rest = get_rest_client()
+                raw_nodes = rest.nodes.list(self.deployment.id)
+                raw_node_instances = rest.node_instances.list(
+                    self.deployment.id)
 
-        if self.local:
-            storage = self.internal.handler.storage
-            raw_nodes = storage.get_nodes()
-            raw_node_instances = storage.get_node_instances()
-        else:
-            rest = get_rest_client()
-            raw_nodes = rest.nodes.list(self.deployment.id)
-            raw_node_instances = rest.node_instances.list(self.deployment.id)
-
-        WorkflowNodesAndInstancesContainer.__init__(self, self, raw_nodes,
-                                                    raw_node_instances)
+            WorkflowNodesAndInstancesContainer.__init__(self, self, raw_nodes,
+                                                        raw_node_instances)
 
     def _build_cloudify_context(self, *args):
         context = super(
@@ -855,10 +872,11 @@ class CloudifyWorkflowContext(
 class CloudifySystemWideWorkflowContext(_WorkflowContextBase):
 
     def __init__(self, ctx):
-        super(CloudifySystemWideWorkflowContext, self).__init__(
-            ctx,
-            SystemWideWfRemoteContextHandler
-        )
+        with current_workflow_ctx.push(self):
+            super(CloudifySystemWideWorkflowContext, self).__init__(
+                ctx,
+                SystemWideWfRemoteContextHandler
+            )
         self._dep_contexts = None
 
     class _ManagedCloudifyWorkflowContext(CloudifyWorkflowContext):
@@ -874,6 +892,7 @@ class CloudifySystemWideWorkflowContext(_WorkflowContextBase):
     def deployments_contexts(self):
         if self._dep_contexts is None:
             self._dep_contexts = {}
+
             rest = get_rest_client()
             for dep in rest.deployments.list():
                 dep_ctx = self._context.copy()
@@ -914,7 +933,7 @@ class CloudifyWorkflowContextInternal(object):
         # local task processing
         thread_pool_size = self.workflow_context._local_task_thread_pool_size
         self.local_tasks_processor = LocalTasksProcessing(
-            is_local_context=self.workflow_context.local,
+            self.workflow_context,
             thread_pool_size=thread_pool_size)
 
     def get_task_configuration(self):
@@ -993,20 +1012,20 @@ class CloudifyWorkflowContextInternal(object):
 
 class LocalTasksProcessing(object):
 
-    def __init__(self, is_local_context, thread_pool_size=1):
+    def __init__(self, workflow_ctx, thread_pool_size=1):
         self._local_tasks_queue = Queue.Queue()
         self._local_task_processing_pool = []
-        self._is_local_context = is_local_context
+        self._is_local_context = workflow_ctx.local
         for i in range(thread_pool_size):
             name = 'Task-Processor-{0}'.format(i + 1)
-            if is_local_context:
+            if self._is_local_context:
                 thread = threading.Thread(target=self._process_local_task,
-                                          name=name)
+                                          name=name, args=(workflow_ctx, ))
                 thread.daemon = True
             else:
                 # this is a remote workflow, use an AMQPWrappedThread
                 thread = AMQPWrappedThread(target=self._process_local_task,
-                                           name=name)
+                                           name=name, args=(workflow_ctx, ))
             self._local_task_processing_pool.append(thread)
         self.stopped = False
 
@@ -1023,16 +1042,17 @@ class LocalTasksProcessing(object):
     def add_task(self, task):
         self._local_tasks_queue.put(task)
 
-    def _process_local_task(self):
+    def _process_local_task(self, workflow_ctx):
         # see CFY-1442
-        while not self.stopped:
-            try:
-                task = self._local_tasks_queue.get(timeout=1)
-                task()
-            # may seem too general, but daemon threads are just great.
-            # anyway, this is properly unit tested, so we should be good.
-            except:
-                pass
+        with current_workflow_ctx.push(workflow_ctx):
+            while not self.stopped:
+                try:
+                    task = self._local_tasks_queue.get(timeout=1)
+                    task()
+                # may seem too general, but daemon threads are just great.
+                # anyway, this is properly unit tested, so we should be good.
+                except:
+                    pass
 
 # Local/Remote Handlers
 
@@ -1085,9 +1105,9 @@ class CloudifyWorkflowContextHandler(object):
                             additional_context=None):
         raise NotImplementedError('Implemented by subclasses')
 
-    def download_blueprint_resource(self,
-                                    resource_path,
-                                    target_path=None):
+    def download_deployment_resource(self,
+                                     resource_path,
+                                     target_path=None):
         raise NotImplementedError('Implemented by subclasses')
 
     def start_deployment_modification(self, nodes):
@@ -1097,6 +1117,9 @@ class CloudifyWorkflowContextHandler(object):
         raise NotImplementedError('Implemented by subclasses')
 
     def rollback_deployment_modification(self, modification):
+        raise NotImplementedError('Implemented by subclasses')
+
+    def scaling_groups(self):
         raise NotImplementedError('Implemented by subclasses')
 
 
@@ -1135,12 +1158,12 @@ class RemoteContextHandler(CloudifyWorkflowContextHandler):
                 if len(runtime_props) == 0:
                     host_node_instance = get_node_instance(host_id)
                     cloudify_agent = host_node_instance.runtime_properties.get(
-                        'cloudify_agent')
-                    if not cloudify_agent:
+                        'cloudify_agent', {})
+                    if property_name not in cloudify_agent:
                         raise exceptions.NonRecoverableError(
-                            'Missing cloudify_agent runtime information. '
-                            'This most likely means that the Compute node '
-                            'never started successfully')
+                            'Missing cloudify_agent.{0} runtime information. '
+                            'This most likely means that the Compute node was '
+                            'never started successfully'.format(property_name))
                     runtime_props.append(cloudify_agent)
                 return runtime_props[0][property_name]
             else:
@@ -1171,7 +1194,9 @@ class RemoteContextHandler(CloudifyWorkflowContextHandler):
 
     @property
     def operation_cloudify_context(self):
-        return {'local': False}
+        return {'local': False,
+                'bypass_maintenance': utils.get_is_bypass_maintenance(),
+                'rest_token': utils.get_rest_token()}
 
     def get_set_state_task(self,
                            workflow_node_instance,
@@ -1190,18 +1215,22 @@ class RemoteContextHandler(CloudifyWorkflowContextHandler):
             return get_node_instance(workflow_node_instance.id).state
         return get_state_task
 
-    def download_blueprint_resource(self,
-                                    blueprint_id,
-                                    resource_path,
-                                    target_path=None):
+    def download_deployment_resource(self,
+                                     blueprint_id,
+                                     deployment_id,
+                                     resource_path,
+                                     target_path=None):
         logger = self.workflow_ctx.logger
-        return download_blueprint_resource(blueprint_id=blueprint_id,
-                                           resource_path=resource_path,
-                                           target_path=target_path,
-                                           logger=logger)
+        return download_resource(blueprint_id=blueprint_id,
+                                 deployment_id=deployment_id,
+                                 resource_path=resource_path,
+                                 target_path=target_path,
+                                 logger=logger)
 
 
 class RemoteCloudifyWorkflowContextHandler(RemoteContextHandler):
+
+    _scaling_groups = None
 
     def get_node_logging_handler(self, workflow_node_instance):
         return CloudifyWorkflowNodeLoggingHandler(workflow_node_instance,
@@ -1211,12 +1240,13 @@ class RemoteCloudifyWorkflowContextHandler(RemoteContextHandler):
         return CloudifyWorkflowLoggingHandler(self.workflow_ctx,
                                               out_func=logs.amqp_log_out)
 
-    def download_blueprint_resource(self,
-                                    resource_path,
-                                    target_path=None):
+    def download_deployment_resource(self,
+                                     resource_path,
+                                     target_path=None):
         return super(RemoteCloudifyWorkflowContextHandler, self) \
-            .download_blueprint_resource(
+            .download_deployment_resource(
                 blueprint_id=self.workflow_ctx.blueprint.id,
+                deployment_id=self.workflow_ctx.deployment.id,
                 resource_path=resource_path,
                 target_path=target_path)
 
@@ -1261,6 +1291,16 @@ class RemoteCloudifyWorkflowContextHandler(RemoteContextHandler):
                                      additional_context=additional_context,
                                      out_func=logs.amqp_event_out)
         return send_event_task
+
+    @property
+    def scaling_groups(self):
+        if not self._scaling_groups:
+            deployment_id = self.workflow_ctx.deployment.id
+            client = get_rest_client()
+            deployment = client.deployments.get(
+                deployment_id, _include=['scaling_groups'])
+            self._scaling_groups = deployment['scaling_groups']
+        return self._scaling_groups
 
 
 class SystemWideWfRemoteContextHandler(RemoteContextHandler):
@@ -1366,11 +1406,15 @@ class LocalCloudifyWorkflowContextHandler(CloudifyWorkflowContextHandler):
                             additional_context=additional_context,
                             out_func=logs.stdout_event_out)
 
-    def download_blueprint_resource(self,
-                                    resource_path,
-                                    target_path=None):
+    def download_deployment_resource(self,
+                                     resource_path,
+                                     target_path=None):
         return self.storage.download_resource(resource_path=resource_path,
                                               target_path=target_path)
+
+    @property
+    def scaling_groups(self):
+        return self.storage.plan.get('scaling_groups', {})
 
 
 class Modification(object):
@@ -1450,6 +1494,10 @@ class WorkflowDeploymentContext(context.DeploymentContext):
         """
         handler = self.workflow_ctx.internal.handler
         return handler.start_deployment_modification(nodes)
+
+    @property
+    def scaling_groups(self):
+        return self.workflow_ctx.internal.handler.scaling_groups
 
 
 def task_config(fn=None, **arguments):

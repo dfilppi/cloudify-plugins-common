@@ -15,7 +15,6 @@
 
 
 import sys
-import time
 import logging
 import json
 import datetime
@@ -23,10 +22,11 @@ from functools import wraps
 
 from cloudify import amqp_client
 from cloudify import amqp_client_utils
-from cloudify.event import Event
+from cloudify import event as _event
 from cloudify.exceptions import ClosedAMQPClientException
 
-EVENT_CLASS = Event
+EVENT_CLASS = _event.Event
+EVENT_VERBOSITY_LEVEL = _event.NO_VERBOSE
 
 
 def message_context_from_cloudify_context(ctx):
@@ -141,7 +141,7 @@ class CloudifyWorkflowNodeLoggingHandler(CloudifyBaseLoggingHandler):
 
 
 def init_cloudify_logger(handler, logger_name,
-                         logging_level=logging.INFO):
+                         logging_level=logging.DEBUG):
     """
     Instantiate an amqp backed logger based on the provided handler
     for sending log messages to RabbitMQ
@@ -159,6 +159,7 @@ def init_cloudify_logger(handler, logger_name,
     for h in logger.handlers:
         logger.removeHandler(h)
     handler.setFormatter(logging.Formatter("%(message)s"))
+    handler.setLevel(logging_level)
     logger.propagate = True
     logger.addHandler(handler)
     return logger
@@ -283,8 +284,8 @@ def _send_event(ctx, context_type, event_type,
 
 
 def populate_base_item(item, message_type):
-    timezone = time.strftime("%z", time.gmtime())
-    timestamp = str(datetime.datetime.now())[0:-3] + timezone
+    # Adding 'Z' to match ISO format
+    timestamp = '{0}Z'.format(datetime.datetime.now().isoformat()[:-3])
     item['timestamp'] = timestamp
     item['message_code'] = None
     item['type'] = message_type
@@ -302,16 +303,25 @@ def amqp_log_out(log):
 
 def stdout_event_out(event):
     populate_base_item(event, 'cloudify_event')
-    sys.stdout.write('{0}\n'.format(create_event_message_prefix(event)))
+    output = create_event_message_prefix(event)
+    if output:
+        sys.stdout.write('{0}\n'.format(output))
+        sys.stdout.flush()
 
 
 def stdout_log_out(log):
     populate_base_item(log, 'cloudify_log')
-    sys.stdout.write('{0}\n'.format(create_event_message_prefix(log)))
+    output = create_event_message_prefix(log)
+    if output:
+        sys.stdout.write('{0}\n'.format(output))
+        sys.stdout.flush()
 
 
 def create_event_message_prefix(event):
-    return str(EVENT_CLASS(event))
+    event_obj = EVENT_CLASS(event, verbosity_level=EVENT_VERBOSITY_LEVEL)
+    if not event_obj.has_output:
+        return None
+    return str(event_obj)
 
 
 def with_amqp_client(func):

@@ -16,24 +16,25 @@
 from cloudify import constants, utils
 from cloudify.decorators import workflow
 from cloudify.plugins import lifecycle
+from cloudify.manager import get_rest_client
 
 
 @workflow
 def install(ctx, **kwargs):
     """Default install workflow"""
-
     lifecycle.install_node_instances(
         graph=ctx.graph_mode(),
         node_instances=set(ctx.node_instances))
 
 
 @workflow
-def uninstall(ctx, **kwargs):
+def uninstall(ctx, ignore_failure=False, **kwargs):
     """Default uninstall workflow"""
 
     lifecycle.uninstall_node_instances(
         graph=ctx.graph_mode(),
-        node_instances=set(ctx.node_instances))
+        node_instances=set(ctx.node_instances),
+        ignore_failure=ignore_failure)
 
 
 @workflow
@@ -41,6 +42,7 @@ def auto_heal_reinstall_node_subgraph(
         ctx,
         node_instance_id,
         diagnose_value='Not provided',
+        ignore_failure=True,
         **kwargs):
     """Reinstalls the whole subgraph of the system topology
 
@@ -51,6 +53,7 @@ def auto_heal_reinstall_node_subgraph(
     :param ctx: cloudify context
     :param node_id: failing node's id
     :param diagnose_value: diagnosed reason of failure
+    :param ignore_failure: ignore operations failures in uninstall workflow
     """
 
     ctx.logger.info("Starting 'heal' workflow on {0}, Diagnosis: {1}"
@@ -65,20 +68,27 @@ def auto_heal_reinstall_node_subgraph(
     lifecycle.reinstall_node_instances(
         graph=graph,
         node_instances=subgraph_node_instances,
-        intact_nodes=intact_nodes)
+        related_nodes=intact_nodes,
+        ignore_failure=ignore_failure)
 
 
 @workflow
-def scale(ctx, node_id, delta, scale_compute, **kwargs):
-    """Scales in/out the subgraph of node_id.
+def scale_entity(ctx,
+                 scalable_entity_name,
+                 delta,
+                 scale_compute,
+                 ignore_failure=False,
+                 **kwargs):
+    """Scales in/out the subgraph of node_or_group_name.
 
-    If `scale_compute` is set to false, the subgraph will consist of all
-    the nodes that are contained in `node_id` and `node_id` itself.
-    If `scale_compute` is set to true, the subgraph will consist of all
-    nodes that are contained in the compute node that contains `node_id`
-    and the compute node itself.
-    If `node_id` is not contained in a compute node and is not a compute node,
-    this property is ignored.
+    If a node name is passed, and `scale_compute` is set to false, the
+    subgraph will consist of all the nodes that are contained in the node and
+    the node itself.
+    If a node name is passed, and `scale_compute` is set to true, the subgraph
+    will consist of all nodes that are contained in the compute node that
+    contains the node and the compute node itself.
+    If a group name or a node that is not contained in a compute
+    node, is passed, this property is ignored.
 
     `delta` is used to specify the scale factor.
     For `delta > 0`: If current number of instances is `N`, scale out to
@@ -87,29 +97,47 @@ def scale(ctx, node_id, delta, scale_compute, **kwargs):
     `N - |delta|`.
 
     :param ctx: cloudify context
-    :param node_id: the node_id to scale
+    :param scalable_entity_name: the node or group name to scale
     :param delta: scale in/out factor
     :param scale_compute: should scale apply on compute node containing
-                          'node_id'
+                          the specified node
+    :param ignore_failure: ignore operations failures in uninstall workflow
     """
-    graph = ctx.graph_mode()
-    node = ctx.get_node(node_id)
-    if not node:
-        raise ValueError("Node {0} doesn't exist".format(node_id))
+    if isinstance(delta, basestring):
+        try:
+            delta = int(delta)
+        except ValueError:
+            raise ValueError('The delta parameter must be a number. Got: {0}'
+                             .format(delta))
+
     if delta == 0:
         ctx.logger.info('delta parameter is 0, so no scaling will take place.')
         return
-    host_node = node.host_node
-    scaled_node = host_node if (scale_compute and host_node) else node
-    curr_num_instances = scaled_node.number_of_instances
-    planned_num_instances = curr_num_instances + delta
-    if planned_num_instances < 0:
-        raise ValueError('Provided delta: {0} is illegal. current number of'
-                         'instances of node {1} is {2}'
-                         .format(delta, node_id, curr_num_instances))
 
+    scaling_group = ctx.deployment.scaling_groups.get(scalable_entity_name)
+    if scaling_group:
+        curr_num_instances = scaling_group['properties']['current_instances']
+        planned_num_instances = curr_num_instances + delta
+        scale_id = scalable_entity_name
+    else:
+        node = ctx.get_node(scalable_entity_name)
+        if not node:
+            raise ValueError("No scalable entity named {0} was found".format(
+                scalable_entity_name))
+        host_node = node.host_node
+        scaled_node = host_node if (scale_compute and host_node) else node
+        curr_num_instances = scaled_node.number_of_instances
+        planned_num_instances = curr_num_instances + delta
+        scale_id = scaled_node.id
+
+    if planned_num_instances < 0:
+        raise ValueError('Provided delta: {0} is illegal. current number of '
+                         'instances of entity {1} is {2}'
+                         .format(delta,
+                                 scalable_entity_name,
+                                 curr_num_instances))
     modification = ctx.deployment.start_modification({
-        scaled_node.id: {
+        scale_id: {
             'instances': planned_num_instances
 
             # These following parameters are not exposed at the moment,
@@ -120,7 +148,7 @@ def scale(ctx, node_id, delta, scale_compute, **kwargs):
             # Special care should be taken because if `scale_compute == True`
             # (which is the default), then these ids should be the compute node
             # instance ids which are not necessarily instances of the node
-            # specified by `node_id`.
+            # specified by `scalable_entity_name`.
 
             # Node instances denoted by these instance ids should be *kept* if
             # possible.
@@ -131,6 +159,7 @@ def scale(ctx, node_id, delta, scale_compute, **kwargs):
             # 'removed_ids_include_hint': []
         }
     })
+    graph = ctx.graph_mode()
     try:
         ctx.logger.info('Deployment modification started. '
                         '[modification_id={0}]'.format(modification.id))
@@ -143,7 +172,7 @@ def scale(ctx, node_id, delta, scale_compute, **kwargs):
                 lifecycle.install_node_instances(
                     graph=graph,
                     node_instances=added,
-                    intact_nodes=related)
+                    related_nodes=related)
             except:
                 ctx.logger.error('Scale out failed, scaling back in.')
                 for task in graph.tasks_iter():
@@ -151,7 +180,8 @@ def scale(ctx, node_id, delta, scale_compute, **kwargs):
                 lifecycle.uninstall_node_instances(
                     graph=graph,
                     node_instances=added,
-                    intact_nodes=related)
+                    ignore_failure=ignore_failure,
+                    related_nodes=related)
                 raise
         else:
             removed_and_related = set(modification.removed.node_instances)
@@ -161,7 +191,8 @@ def scale(ctx, node_id, delta, scale_compute, **kwargs):
             lifecycle.uninstall_node_instances(
                 graph=graph,
                 node_instances=removed,
-                intact_nodes=related)
+                ignore_failure=ignore_failure,
+                related_nodes=related)
     except:
         ctx.logger.warn('Rolling back deployment modification. '
                         '[modification_id={0}]'.format(modification.id))
@@ -183,6 +214,16 @@ def scale(ctx, node_id, delta, scale_compute, **kwargs):
                             ' state.'
                             '[modification_id={0}]'.format(modification.id))
             raise
+
+
+# Kept for backward compatibility with older versions of types.yaml
+@workflow
+def scale(ctx, node_id, delta, scale_compute, **kwargs):
+    return scale_entity(ctx=ctx,
+                        scalable_entity_name=node_id,
+                        delta=delta,
+                        scale_compute=scale_compute,
+                        **kwargs)
 
 
 def _filter_node_instances(ctx, node_ids, node_instance_ids, type_names):
@@ -211,7 +252,8 @@ def _get_all_host_instances(ctx):
 
 @workflow
 def install_new_agents(ctx, install_agent_timeout, node_ids,
-                       node_instance_ids, validate=True, install=True, **_):
+                       node_instance_ids, validate=True, install=True,
+                       install_script=None, **_):
     if node_ids or node_instance_ids:
         filtered_node_instances = _filter_node_instances(
             ctx=ctx,
@@ -256,7 +298,8 @@ def install_new_agents(ctx, install_agent_timeout, node_ids,
                 host.execute_operation(
                     'cloudify.interfaces.cloudify_agent.validate_amqp',
                     kwargs={
-                        'fail_on_agent_not_installable': True
+                        'fail_on_agent_not_installable': True,
+                        'install_script': install_script
                     }),
                 host.send_event('Validation done'))
     if install:
@@ -267,13 +310,17 @@ def install_new_agents(ctx, install_agent_timeout, node_ids,
                 host.send_event('Installing new agent'),
                 host.execute_operation(
                     'cloudify.interfaces.cloudify_agent.create_amqp',
-                    kwargs={'install_agent_timeout': install_agent_timeout},
+                    kwargs={
+                        'install_agent_timeout': install_agent_timeout,
+                        'install_script': install_script
+                    },
                     allow_kwargs_override=True),
                 host.send_event('New agent installed.'),
                 host.execute_operation(
                     'cloudify.interfaces.cloudify_agent.validate_amqp',
                     kwargs={
-                        'fail_on_agent_dead': True
+                        'fail_on_agent_dead': True,
+                        'install_script': install_script
                     }),
                 *lifecycle.prepare_running_agent(host)
             )
@@ -351,3 +398,80 @@ def execute_operation(ctx, operation, operation_kwargs, allow_kwargs_override,
                                      subgraphs[rel.target_id])
 
     graph.execute()
+
+
+@workflow
+def update(ctx,
+           update_id,
+           added_instance_ids,
+           added_target_instances_ids,
+           removed_instance_ids,
+           remove_target_instance_ids,
+           modified_entity_ids,
+           extended_instance_ids,
+           extend_target_instance_ids,
+           reduced_instance_ids,
+           reduce_target_instance_ids,
+           skip_install,
+           skip_uninstall,
+           ignore_failure=False):
+    instances_by_change = {
+        'added_instances': (added_instance_ids, []),
+        'added_target_instances_ids': (added_target_instances_ids, []),
+        'removed_instances': (removed_instance_ids, []),
+        'remove_target_instance_ids': (remove_target_instance_ids, []),
+        'extended_and_target_instances':
+            (extended_instance_ids + extend_target_instance_ids, []),
+        'reduced_and_target_instances':
+            (reduced_instance_ids + reduce_target_instance_ids, []),
+    }
+
+    for instance in ctx.node_instances:
+
+        instance_holders = \
+            [instance_holder
+             for _, (changed_ids, instance_holder)
+             in instances_by_change.iteritems()
+             if instance.id in changed_ids]
+
+        for instance_holder in instance_holders:
+            instance_holder.append(instance)
+
+    if not skip_install:
+        graph = ctx.graph_mode()
+        # Adding nodes or node instances should be based on modified instances
+        lifecycle.install_node_instances(
+            graph=graph,
+            node_instances=set(instances_by_change['added_instances'][1]),
+            related_nodes=set(instances_by_change['added_target_instances_ids']
+                              [1]))
+
+        # This one as well.
+        lifecycle.execute_establish_relationships(
+            graph=ctx.graph_mode(),
+            node_instances=set(
+                    instances_by_change['extended_and_target_instances'][1]),
+            modified_relationship_ids=modified_entity_ids['relationship']
+        )
+
+    if not skip_uninstall:
+        graph = ctx.graph_mode()
+
+        lifecycle.execute_unlink_relationships(
+            graph=graph,
+            node_instances=set(
+                    instances_by_change['reduced_and_target_instances'][1]),
+            modified_relationship_ids=modified_entity_ids['relationship']
+        )
+
+        lifecycle.uninstall_node_instances(
+            graph=graph,
+            node_instances=set(instances_by_change['removed_instances'][1]),
+            ignore_failure=ignore_failure,
+            related_nodes=set(
+                    instances_by_change['remove_target_instance_ids'][1])
+        )
+
+    # Finalize the commit (i.e. remove relationships or nodes)
+    client = get_rest_client()
+    client.deployment_updates.finalize_commit(update_id)

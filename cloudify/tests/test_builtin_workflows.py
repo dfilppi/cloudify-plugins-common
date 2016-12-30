@@ -21,6 +21,8 @@ import testtools
 from testtools.matchers import MatchesAny, Equals, GreaterThan
 from nose.tools import nottest
 
+from cloudify import exceptions
+from cloudify.plugins import lifecycle
 from cloudify.decorators import operation
 from cloudify.test_utils import workflow_test
 
@@ -33,6 +35,8 @@ class GlobalCounter(object):
         result = self.count
         self.count += 1
         return result
+
+
 global_counter = GlobalCounter()
 
 
@@ -325,21 +329,42 @@ class TestScale(testtools.TestCase):
                                      'test-scale-blueprint.yaml')
 
     @workflow_test(scale_blueprint_path)
+    def test_delta_str_int_conversion(self, cfy_local):
+        cfy_local.execute('scale', parameters={'scalable_entity_name': 'node',
+                                               'delta': '0'})
+
+    @workflow_test(scale_blueprint_path)
     def test_no_node(self, cfy_local):
-        with testtools.ExpectedException(ValueError, ".*mock doesn't exist.*"):
-            cfy_local.execute('scale', parameters={'node_id': 'mock'})
+        with testtools.ExpectedException(ValueError, ".*mock was found.*"):
+            cfy_local.execute(
+                'scale', parameters={'scalable_entity_name': 'mock'})
+        with testtools.ExpectedException(ValueError, ".*mock was found.*"):
+            cfy_local.execute('scale_old', parameters={'node_id': 'mock'})
 
     @workflow_test(scale_blueprint_path)
     def test_zero_delta(self, cfy_local):
         # should simply work
-        cfy_local.execute('scale', parameters={'node_id': 'node',
+        cfy_local.execute('scale', parameters={'scalable_entity_name': 'node',
                                                'delta': 0})
+        cfy_local.execute('scale_old', parameters={'node_id': 'node',
+                                                   'delta': 0})
 
     @workflow_test(scale_blueprint_path)
     def test_illegal_delta(self, cfy_local):
         with testtools.ExpectedException(ValueError, ".*-2 is illegal.*"):
-            cfy_local.execute('scale', parameters={'node_id': 'node',
-                                                   'delta': -2})
+            cfy_local.execute('scale', parameters={
+                'scalable_entity_name': 'node',
+                'delta': -2})
+        with testtools.ExpectedException(ValueError, ".*-2 is illegal.*"):
+            cfy_local.execute('scale_old', parameters={'node_id': 'node',
+                                                       'delta': -2})
+
+    @workflow_test(scale_blueprint_path)
+    def test_illegal_str_delta(self, cfy_local):
+        with testtools.ExpectedException(ValueError, ".*must be a number.*"):
+            cfy_local.execute('scale',
+                              parameters={'scalable_entity_name': 'node',
+                                          'delta': 'not a number'})
 
 
 class TestSubgraphWorkflowLogic(testtools.TestCase):
@@ -405,6 +430,164 @@ class TestSubgraphWorkflowLogic(testtools.TestCase):
         assert_op(sorted_invocations[2], 'node3', 'establish')
         assert_op(sorted_invocations[3], 'node2', 'create')
 
+    @workflow_test(path.join(
+        'resources', 'blueprints', 'test-blueprint-ignore-failure.yaml'))
+    def test_heal_correct_order_ignore_failure_false(self, env):
+        try:
+            env.execute('heal', parameters={
+                'ignore_failure': False,
+                'node_instance_id': env.storage.get_node_instances(
+                    node_id='node1')[0].id})
+        except RuntimeError:
+            all_invocations = []
+            for instance in env.storage.get_node_instances():
+                invocations = instance.runtime_properties.get(
+                    'invocations', [])
+                all_invocations += invocations
+            self.assertEqual(1, len(all_invocations))
+        else:
+            fail()
+
+    @workflow_test(path.join(
+        'resources', 'blueprints', 'test-blueprint-ignore-failure.yaml'))
+    def test_heal_correct_order_ignore_failure_true(self, env):
+        env.execute('heal', parameters={
+            'ignore_failure': True,
+            'node_instance_id': env.storage.get_node_instances(
+                node_id='node1')[0].id})
+        all_invocations = []
+        for instance in env.storage.get_node_instances():
+            invocations = instance.runtime_properties.get('invocations', [])
+            all_invocations += invocations
+        self.assertEqual(4, len(all_invocations))
+
+
+def mock_uninstall(graph, node_instances, ignore_failure, related_nodes=None):
+    raise RuntimeError('Test - ignore_failure is: ' + str(ignore_failure))
+
+
+class TestUpdateIgnoreFailure(testtools.TestCase):
+
+    def __init__(self, *args, **kwargs):
+        super(TestUpdateIgnoreFailure, self).__init__(*args, **kwargs)
+        self.original_uninstall = lifecycle.uninstall_node_instances
+
+    def setUp(self):
+        super(TestUpdateIgnoreFailure, self).setUp()
+        lifecycle.uninstall_node_instances = mock_uninstall
+
+    def tearDown(self):
+        lifecycle.uninstall_node_instances = self.original_uninstall
+        super(TestUpdateIgnoreFailure, self).tearDown()
+
+    @workflow_test(path.join(
+        'resources', 'blueprints', 'test-blueprint-ignore-failure.yaml'))
+    def test_update_ignore_failure_false(self, env):
+        try:
+            env.execute('update', parameters={
+                'ignore_failure': False,
+                'modified_entity_ids': {'relationship': ''}
+            })
+        except RuntimeError as e:
+            self.assertEqual('Test - ignore_failure is: False', str(e))
+        else:
+            fail()
+
+    @workflow_test(path.join(
+        'resources', 'blueprints', 'test-blueprint-ignore-failure.yaml'))
+    def test_update_ignore_failure_true(self, env):
+        try:
+            env.execute('update', parameters={
+                'ignore_failure': True,
+                'modified_entity_ids': {'relationship': ''}
+            })
+        except RuntimeError as e:
+            self.assertEqual('Test - ignore_failure is: True', str(e))
+        else:
+            fail()
+
+
+class TestRelationshipOrderInLifecycleWorkflows(testtools.TestCase):
+
+    blueprint_path = path.join('resources', 'blueprints',
+                               'test-relationship-order-blueprint.yaml')
+
+    @workflow_test(blueprint_path)
+    def test_install_uninstall_and_heal_relationships_order(self, env):
+        self.env = env
+
+        self._assert_invocation_order(
+            workflow='install',
+            expected_invocations=[
+                ('main',    'establish', 'node1'),
+                ('main',    'establish', 'node2'),
+                ('main',    'establish', 'main_compute'),
+                ('main',    'establish', 'node4'),
+                ('main',    'establish', 'node5'),
+                ('depends', 'establish', 'main_compute'),
+                ('depends', 'establish', 'main')
+            ])
+
+        self._assert_invocation_order(
+            workflow='heal',
+            expected_invocations=[
+                ('depends', 'unlink', 'main'),
+                ('depends', 'unlink', 'main_compute'),
+                ('main',    'unlink', 'node5'),
+                ('main',    'unlink', 'node4'),
+                ('main',    'unlink', 'main_compute'),
+                ('main',    'unlink', 'node2'),
+                ('main',    'unlink', 'node1'),
+                ('main',    'establish', 'node1'),
+                ('main',    'establish', 'node2'),
+                ('main',    'establish', 'main_compute'),
+                ('main',    'establish', 'node4'),
+                ('main',    'establish', 'node5'),
+                ('depends', 'establish', 'main_compute'),
+                ('depends', 'establish', 'main')
+            ])
+
+        self._assert_invocation_order(
+            workflow='uninstall',
+            expected_invocations=[
+                ('depends', 'unlink', 'main'),
+                ('depends', 'unlink', 'main_compute'),
+                ('main',    'unlink', 'node5'),
+                ('main',    'unlink', 'node4'),
+                ('main',    'unlink', 'main_compute'),
+                ('main',    'unlink', 'node2'),
+                ('main',    'unlink', 'node1'),
+            ])
+
+    def _assert_invocation_order(self, workflow, expected_invocations):
+        parameters = {}
+        if workflow == 'heal':
+            parameters = {
+                'node_instance_id': self._get_node_instance('main').id
+            }
+        elif workflow == 'uninstall':
+            parameters = {
+                'ignore_failure': True
+            }
+        self.env.execute(workflow, parameters=parameters)
+        main_instance = self._get_node_instance('main')
+        depends_on_main = self._get_node_instance('depends')
+        invocations = main_instance.runtime_properties['invocations']
+        invocations += depends_on_main.runtime_properties['invocations']
+        invocations.sort(key=lambda i: i['counter'])
+        for index, (node_id, op, target) in enumerate(expected_invocations):
+            invocation = invocations[index]
+            self.assertEqual(invocation['node_id'], node_id)
+            self.assertEqual(invocation['operation'].split('.')[-1], op)
+            self.assertEqual(invocation['target_node'], target)
+        for instance in self.env.storage.get_node_instances():
+            self.env.storage.update_node_instance(instance.id,
+                                                  instance.version,
+                                                  runtime_properties={})
+
+    def _get_node_instance(self, node_id):
+        return self.env.storage.get_node_instances(node_id=node_id)[0]
+
 
 @nottest
 @operation
@@ -434,6 +617,12 @@ def target_operation(ctx, **_):
 @operation
 def node_operation(ctx, **_):
     _write_operation(ctx)
+
+
+@operation
+def fail_stop(ctx, **_):
+    _write_operation(ctx)
+    raise exceptions.NonRecoverableError('')
 
 
 @operation

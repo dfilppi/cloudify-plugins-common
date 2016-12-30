@@ -30,25 +30,22 @@ logger = logging.getLogger(__name__)
 
 class AMQPClient(object):
 
-    EVENTS_QUEUE_NAME = 'cloudify-events'
-    LOGS_QUEUE_NAME = 'cloudify-logs'
+    EVENTS_EXCHANGE_NAME = 'cloudify-events'
+    LOGS_EXCHANGE_NAME = 'cloudify-logs'
     channel_settings = {
         'auto_delete': True,
         'durable': True,
-        'exclusive': False
     }
 
     def __init__(self,
                  amqp_user='guest',
                  amqp_pass='guest',
-                 amqp_host=None,
+                 amqp_host='localhost',
                  ssl_enabled=False,
                  ssl_cert_path=''):
         self.connection = None
         self.channel = None
         self._is_closed = False
-        if amqp_host is None:
-            amqp_host = utils.get_manager_ip()
         credentials = pika.credentials.PlainCredentials(
             username=amqp_user,
             password=amqp_pass)
@@ -66,18 +63,20 @@ class AMQPClient(object):
     def _connect(self):
         self.connection = pika.BlockingConnection(self._connection_parameters)
         self.channel = self.connection.channel()
-        for queue in [self.EVENTS_QUEUE_NAME, self.LOGS_QUEUE_NAME]:
-            self.channel.queue_declare(queue=queue, **self.channel_settings)
+        self.channel.confirm_delivery()
+        for exchange in [self.EVENTS_EXCHANGE_NAME, self.LOGS_EXCHANGE_NAME]:
+            self.channel.exchange_declare(exchange=exchange, type='fanout',
+                                          **self.channel_settings)
 
     def publish_message(self, message, message_type):
         if self._is_closed:
             raise exceptions.ClosedAMQPClientException(
                 'Publish failed, AMQP client already closed')
         if message_type == 'event':
-            routing_key = self.EVENTS_QUEUE_NAME
+            exchange = self.EVENTS_EXCHANGE_NAME
         else:
-            routing_key = self.LOGS_QUEUE_NAME
-        exchange = ''
+            exchange = self.LOGS_EXCHANGE_NAME
+        routing_key = ''
         body = json.dumps(message)
         try:
             self.channel.basic_publish(exchange=exchange,
@@ -101,12 +100,23 @@ class AMQPClient(object):
         self._is_closed = True
         thread = threading.current_thread()
         if self.channel:
-            logger.debug('Closing channel of thread {0}'.format(thread))
-            self.channel.close()
+            logger.debug('Closing amqp channel of thread {0}'.format(thread))
+            try:
+                self.channel.close()
+            except Exception as e:
+                # channel might be already closed, log and continue
+                logger.debug('Failed to close amqp channel of thread {0}, '
+                             'reported error: {1}'.format(thread, repr(e)))
+
         if self.connection:
             logger.debug('Closing amqp connection of thread {0}'
                          .format(thread))
-            self.connection.close()
+            try:
+                self.connection.close()
+            except Exception as e:
+                # connection might be already closed, log and continue
+                logger.debug('Failed to close amqp connection of thread {0}, '
+                             'reported error: {1}'.format(thread, repr(e)))
 
 
 def create_client(amqp_host=broker_config.broker_hostname,

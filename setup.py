@@ -16,7 +16,7 @@
 from setuptools import setup
 
 install_requires = [
-    'cloudify-rest-client==3.4a3',
+    'cloudify-rest-client==4.0a11',
     'pika==0.9.14',
     'networkx==1.8.1',
     'proxy_tools==0.1.0',
@@ -31,13 +31,19 @@ except ImportError:
 
 try:
     import argparse  # NOQA
-except ImportError, e:
+except ImportError as e:
     install_requires.append('argparse==1.2.2')
+
+
+try:
+    from collections import OrderedDict  # noqa
+except ImportError:
+    install_requires.append('ordereddict==1.1')
 
 
 setup(
     name='cloudify-plugins-common',
-    version='3.4a3',
+    version='4.0a11',
     author='cosmo-admin',
     author_email='cosmo-admin@gigaspaces.com',
     packages=['cloudify',
@@ -46,7 +52,8 @@ setup(
               'cloudify.plugins',
               'cloudify.celery',
               'cloudify.proxy',
-              'cloudify.test_utils'],
+              'cloudify.test_utils',
+              'cloudify.ctx_wrappers'],
     license='LICENSE',
     description='Contains necessary decorators and utility methods for '
                 'writing Cloudify plugins',
@@ -57,5 +64,8 @@ setup(
             'ctx = cloudify.proxy.client:main',
         ]
     },
-    scripts=['ctx_wrappers/ctx-sh']
+    package_data={'cloudify.ctx_wrappers': ['ctx.py']},
+    scripts=[
+        'ctx_wrappers/ctx-sh'
+    ]
 )

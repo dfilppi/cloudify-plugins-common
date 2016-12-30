@@ -19,6 +19,7 @@ import time
 import uuid
 import Queue
 
+from cloudify import utils
 from cloudify import exceptions
 from cloudify.workflows import api
 
@@ -40,6 +41,8 @@ TASK_FAILED = 'failed'
 TERMINATED_STATES = [TASK_RESCHEDULED, TASK_SUCCEEDED, TASK_FAILED]
 
 DISPATCH_TASK = 'cloudify.dispatch.dispatch'
+
+INSPECT_TIMEOUT = 30
 
 
 def retry_failure_handler(task):
@@ -233,6 +236,20 @@ class WorkflowTask(object):
                 handler_result = HandlerResult.fail()
             elif isinstance(exception, exceptions.RecoverableError):
                 handler_result.retry_after = exception.retry_after
+
+        if not self.is_subgraph:
+            causes = []
+            if isinstance(exception, (exceptions.RecoverableError,
+                                      exceptions.NonRecoverableError)):
+                causes = exception.causes or []
+            if isinstance(self, LocalWorkflowTask):
+                tb = self.async_result._holder.error[1]
+                causes.append(utils.exception_to_error_cause(exception, tb))
+            self.workflow_context.internal.send_task_event(
+                state=self.get_state(),
+                task=self,
+                event={'exception': exception, 'causes': causes})
+
         return handler_result
 
     def __str__(self):
@@ -265,6 +282,10 @@ class WorkflowTask(object):
         """
 
         raise NotImplementedError('Implemented by subclasses')
+
+    @property
+    def is_subgraph(self):
+        return False
 
 
 class RemoteWorkflowTask(WorkflowTask):
@@ -343,13 +364,10 @@ class RemoteWorkflowTask(WorkflowTask):
             self.set_state(TASK_SENT)
             async_result = task.apply_async(task_id=self.id)
             self.async_result = RemoteWorkflowTaskResult(self, async_result)
-        except exceptions.NonRecoverableError as e:
+        except (exceptions.NonRecoverableError,
+                exceptions.RecoverableError) as e:
             self.set_state(TASK_FAILED)
-            self.workflow_context.internal\
-                .send_task_event(TASK_FAILED, self, {'exception': e})
-            self.error = e
-            self.async_result = RemoteWorkflowNotExistTaskResult(self)
-
+            self.async_result = RemoteWorkflowErrorTaskResult(self, e)
         return self.async_result
 
     def is_local(self):
@@ -406,10 +424,12 @@ class RemoteWorkflowTask(WorkflowTask):
         from cloudify_agent.app import app
 
         worker_name = 'celery@{0}'.format(self.target)
-        inspect = app.control.inspect(destination=[worker_name])
-        registered = inspect.registered() or {}
-        result = registered.get(worker_name, set())
-        return set(result)
+        inspect = app.control.inspect(destination=[worker_name],
+                                      timeout=INSPECT_TIMEOUT)
+        registered = inspect.registered()
+        if registered is None or worker_name not in registered:
+            return None
+        return set(registered[worker_name])
 
 
 class LocalWorkflowTask(WorkflowTask):
@@ -493,8 +513,6 @@ class LocalWorkflowTask(WorkflowTask):
                 new_task_state = TASK_RESCHEDULED if isinstance(
                     e, exceptions.OperationRetry) else TASK_FAILED
                 exc_type, exception, tb = sys.exc_info()
-                self.workflow_context.internal.send_task_event(
-                    new_task_state, self, event={'exception': str(exception)})
                 self.async_result._holder.error = (exception, tb)
                 self.set_state(new_task_state)
 
@@ -619,17 +637,18 @@ class WorkflowTaskResult(object):
         raise NotImplementedError('Implemented by subclasses')
 
 
-class RemoteWorkflowNotExistTaskResult(WorkflowTaskResult):
-    def __init__(self, task):
-        super(RemoteWorkflowNotExistTaskResult, self).__init__(task)
-        self.task = task
+class RemoteWorkflowErrorTaskResult(WorkflowTaskResult):
+
+    def __init__(self, task, exception):
+        super(RemoteWorkflowErrorTaskResult, self).__init__(task)
+        self.exception = exception
 
     def _get(self):
-        raise self.task.error
+        raise self.exception
 
     @property
     def result(self):
-        return self.task.error
+        return self.exception
 
 
 class RemoteWorkflowTaskResult(WorkflowTaskResult):
@@ -730,17 +749,19 @@ class HandlerResult(object):
 def verify_worker_alive(name, target, get_registered):
 
     cache = RemoteWorkflowTask.cache
-    registered = cache.get(target, set())
+    registered = cache.get(target)
     if not registered:
         registered = get_registered()
         cache[target] = registered
 
-    if not registered:
-        raise exceptions.NonRecoverableError(
-            'Worker celery@{0} appears to be dead'.format(target))
+    if registered is None:
+        raise exceptions.RecoverableError(
+            'Timed out querying worker celery@{0} for its registered '
+            'tasks. [timeout={1} seconds]'.format(target, INSPECT_TIMEOUT))
 
     if DISPATCH_TASK not in registered:
         raise exceptions.NonRecoverableError(
-            'Missing dispatch task in worker {0} \n'
-            'Registered tasks are: {1}. (This probably means the agent '
-            'configuration is invalid) [{2}]'.format(target, registered, name))
+            'Missing {0} task in worker {1} \n'
+            'Registered tasks are: {2}. (This probably means the agent '
+            'configuration is invalid) [{3}]'.format(
+                DISPATCH_TASK, target, registered, name))

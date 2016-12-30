@@ -1,7 +1,7 @@
 tosca_definitions_version: cloudify_dsl_1_3
 
 imports:
-    - http://www.getcloudify.org/spec/cloudify/4.0m11/types.yaml
+    - http://www.getcloudify.org/spec/cloudify/4.0m1/types.yaml
 
 plugins:
   p:
@@ -20,7 +20,7 @@ node_templates:
     interfaces:
       cloudify.interfaces.lifecycle:
         create: p.cloudify.tests.test_builtin_workflows.node_operation
-        stop: p.cloudify.tests.test_builtin_workflows.node_operation
+        stop: p.cloudify.tests.test_builtin_workflows.fail_stop
     relationships:
       - type: cloudify.relationships.contained_in
         target: node1

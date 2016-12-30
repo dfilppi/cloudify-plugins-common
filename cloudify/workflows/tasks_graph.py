@@ -43,7 +43,6 @@ class TaskDependencyGraph(object):
 
         :param task: The task
         """
-        self.ctx.logger.debug('adding task: {0}'.format(task))
         self.graph.add_node(task.id, task=task)
 
     def get_task(self, task_id):
@@ -61,7 +60,11 @@ class TaskDependencyGraph(object):
 
         :param task: The task
         """
-        self.graph.remove_node(task.id)
+        if task.is_subgraph:
+            for subgraph_task in task.tasks.values():
+                self.remove_task(subgraph_task)
+        if task.id in self.graph:
+            self.graph.remove_node(task.id)
 
     # src depends on dst
     def add_dependency(self, src_task, dst_task):
@@ -74,9 +77,6 @@ class TaskDependencyGraph(object):
         :param src_task: The source task
         :param dst_task: The target task
         """
-
-        self.ctx.logger.debug('adding dependency: {0} -> {1}'.format(src_task,
-                                                                     dst_task))
         if not self.graph.has_node(src_task.id):
             raise RuntimeError('source task {0} is not in graph (task id: '
                                '{1})'.format(src_task, src_task.id))
@@ -201,9 +201,10 @@ class TaskDependencyGraph(object):
         if handler_result.action == tasks.HandlerResult.HANDLER_FAIL:
             if isinstance(task, SubgraphTask) and task.failed_task:
                 task = task.failed_task
-            raise RuntimeError(
-                "Workflow failed: Task failed '{0}' -> {1}".format(task.name,
-                                                                   task.error))
+            message = "Workflow failed: Task failed '{0}'".format(task.name)
+            if task.error:
+                message = '{0} -> {1}'.format(message, task.error)
+            raise RuntimeError(message)
 
         dependents = self.graph.predecessors(task.id)
         removed_edges = [(dependent, task.id)
@@ -287,7 +288,6 @@ class SubgraphTask(tasks.WorkflowTask):
                  name,
                  graph,
                  task_id=None,
-                 info=None,
                  on_success=None,
                  on_failure=None,
                  total_retries=tasks.DEFAULT_SUBGRAPH_TOTAL_RETRIES,
@@ -296,7 +296,7 @@ class SubgraphTask(tasks.WorkflowTask):
         super(SubgraphTask, self).__init__(
             graph.ctx,
             task_id,
-            info=info,
+            info=name,
             on_success=on_success,
             on_failure=on_failure,
             total_retries=total_retries,
@@ -325,6 +325,10 @@ class SubgraphTask(tasks.WorkflowTask):
     def name(self):
         return self._name
 
+    @property
+    def is_subgraph(self):
+        return True
+
     def sequence(self):
         return TaskSequence(self)
 
@@ -346,6 +350,9 @@ class SubgraphTask(tasks.WorkflowTask):
                                        task.containing_subgraph.name,
                                        self.name))
         task.containing_subgraph = self
+
+    def remove_task(self, task):
+        self.graph.remove_task(task)
 
     def add_dependency(self, src_task, dst_task):
         self.graph.add_dependency(src_task, dst_task)

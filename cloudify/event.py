@@ -13,15 +13,23 @@
 #    * See the License for the specific language governing permissions and
 #    * limitations under the License.
 
+from StringIO import StringIO
+
+HIGH_VERBOSE = 3
+MEDIUM_VERBOSE = 2
+LOW_VERBOSE = 1
+NO_VERBOSE = 0
+
 
 class Event(object):
 
-    def __init__(self, event):
+    def __init__(self, event, verbosity_level=None):
         self._event = event
+        self._verbosity_level = verbosity_level
 
     def __str__(self):
         deployment_id = self.deployment_id
-        timestamp = self.timestamp
+        printable_timestamp = self.printable_timestamp
         event_type_indicator = self.event_type_indicator
         message = self.text
         info = self.operation_info
@@ -29,11 +37,17 @@ class Event(object):
         if info:  # spacing in between of the info and the message
             info += ' '
 
-        return '{0} {1} {2} {3}{4}'.format(timestamp,
+        return '{0} {1} {2} {3}{4}'.format(printable_timestamp,
                                            event_type_indicator,
                                            deployment_id,
                                            info,
                                            message)
+
+    @property
+    def has_output(self):
+        return (not self.is_log_message or
+                self._verbosity_level >= MEDIUM_VERBOSE or
+                self.log_level != 'DEBUG')
 
     @property
     def operation_info(self):
@@ -63,6 +77,20 @@ class Event(object):
         message = self._event['message']['text'].encode('utf-8')
         if self.is_log_message:
             message = '{0}: {1}'.format(self.log_level, message)
+        elif (self.event_type in ('task_rescheduled', 'task_failed') and
+              self._verbosity_level > NO_VERBOSE):
+            causes = self._event['context'].get('task_error_causes', [])
+            if causes:
+                multiple_causes = len(causes) > 1
+                causes_out = StringIO()
+                if multiple_causes:
+                    causes_out.write('Causes (most recent cause last):\n')
+                for cause in causes:
+                    if multiple_causes:
+                        causes_out.write('{0}\n'.format('-' * 32))
+                    causes_out.write(cause.get('traceback', ''))
+
+                message = '{0}\n{1}'.format(message, causes_out.getvalue())
         return message
 
     @property
@@ -71,8 +99,11 @@ class Event(object):
 
     @property
     def timestamp(self):
-        return (self._event.get('@timestamp') or self._event['timestamp'])\
-            .split('.')[0]
+        return self._event.get('@timestamp') or self._event['timestamp']
+
+    @property
+    def printable_timestamp(self):
+        return self.timestamp.replace('T', ' ').replace('Z', ' ')
 
     @property
     def event_type_indicator(self):

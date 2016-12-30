@@ -18,7 +18,7 @@ function install_dependencies(){
     echo "## Installing necessary dependencies"
 
     if  which yum; then
-        sudo yum -y install python-devel gcc openssl git libxslt-devel libxml2-devel openldap-devel
+        sudo yum -y install python-devel gcc openssl git libxslt-devel libxml2-devel openldap-devel libffi-devel openssl-devel
     elif which apt-get; then
         sudo apt-get update &&
         sudo apt-get -y install build-essential python-dev
@@ -36,7 +36,14 @@ function install_wagon(){
     echo "## installing wagon"
     virtualenv env
     source env/bin/activate
-    pip install wagon==0.3.0
+    if  which yum; then
+        echo 'redaht/centos machine'
+    elif which apt-get; then
+        echo 'ubuntu/debian machine'
+    else
+        echo 'probably windows machine'
+    fi
+    pip install wagon==0.3.2
 }
 
 function wagon_create_package(){
@@ -57,7 +64,7 @@ function wagon_create_package(){
 
 
 # VERSION/PRERELEASE/BUILD must be exported as they is being read as an env var by the cloudify-agent-packager
-CORE_TAG_NAME="3.4m3"
+CORE_TAG_NAME="4.0m11"
 curl https://raw.githubusercontent.com/cloudify-cosmo/cloudify-packager/$CORE_TAG_NAME/common/provision.sh -o ./common-provision.sh &&
 source common-provision.sh
 
@@ -73,6 +80,7 @@ PLUGIN_S3_FOLDER=$7
 
 export AWS_S3_PATH="org/cloudify3/wagons/$PLUGIN_NAME/$PLUGIN_S3_FOLDER"
 
+install_common_prereqs &&
 print_plugins_params
 install_dependencies &&
 install_wagon &&

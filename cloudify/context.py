@@ -17,6 +17,7 @@ import errno
 import os
 import warnings
 
+from cloudify_rest_client.exceptions import CloudifyClientError
 from cloudify.endpoint import ManagerEndpoint, LocalEndpoint
 from cloudify.logs import init_cloudify_logger
 from cloudify import constants
@@ -164,7 +165,7 @@ class BootstrapContext(object):
         @property
         def broker_ip(self):
             """
-            Returns the IP for connecting to rabbit.
+            Returns the host name or IP of the rabbit server.
             An empty string should result in clients using the manager IP.
             """
             return self._cloudify_agent.get('broker_ip')
@@ -231,23 +232,16 @@ class BootstrapContext(object):
         """
         return self._bootstrap_context.get('resources_prefix', '')
 
-    def broker_config(self, fallback_to_manager_ip=True):
+    def broker_config(self, *args, **kwargs):
         """
         Returns dictionary containing broker configuration.
-
-        :param fallback_to_manager_ip: If True and there is no broker_ip in
-        context, manager ip will be used. Note that manager ip detection is
-        only possible within agent.
         """
         attributes = {}
         bootstrap_agent = self.cloudify_agent
         broker_user, broker_pass = utils.internal.get_broker_credentials(
             bootstrap_agent
         )
-        if bootstrap_agent.broker_ip:
-            attributes['broker_ip'] = bootstrap_agent.broker_ip
-        elif fallback_to_manager_ip:
-            attributes['broker_ip'] = utils.get_manager_ip()
+        attributes['broker_ip'] = bootstrap_agent.broker_ip
         attributes['broker_user'] = broker_user
         attributes['broker_pass'] = broker_pass
         attributes['broker_ssl_enabled'] = bootstrap_agent.broker_ssl_enabled
@@ -327,7 +321,6 @@ class NodeContext(EntityContext):
 
 
 class NodeInstanceContext(EntityContext):
-
     def __init__(self, *args, **kwargs):
         super(NodeInstanceContext, self).__init__(*args, **kwargs)
         self._endpoint = kwargs['endpoint']
@@ -337,11 +330,14 @@ class NodeInstanceContext(EntityContext):
         self._host_ip = None
         self._relationships = None
 
+    def _get_node_instance(self):
+        self._node_instance = self._endpoint.get_node_instance(self.id)
+        self._node_instance.runtime_properties.modifiable = \
+            self._modifiable
+
     def _get_node_instance_if_needed(self):
         if self._node_instance is None:
-            self._node_instance = self._endpoint.get_node_instance(self.id)
-            self._node_instance.runtime_properties.modifiable = \
-                self._modifiable
+            self._get_node_instance()
 
     @property
     def id(self):
@@ -359,7 +355,12 @@ class NodeInstanceContext(EntityContext):
         self._get_node_instance_if_needed()
         return self._node_instance.runtime_properties
 
-    def update(self):
+    @runtime_properties.setter
+    def runtime_properties(self, new_properties):
+        self._get_node_instance_if_needed()
+        self._node_instance.runtime_properties = new_properties
+
+    def update(self, on_conflict=None):
         """
         Stores new/updated runtime properties for the node instance in context
         in Cloudify's storage.
@@ -367,10 +368,61 @@ class NodeInstanceContext(EntityContext):
         This method should be invoked only if its necessary to immediately
         update Cloudify's storage with changes. Otherwise, the method is
         automatically invoked as soon as the task execution is over.
+
+        Updating the runtime properties might fail due to concurrent writes:
+        use a handler function to merge properties, to retry quickly.
+
+        :param on_conflict: Optional function returning the runtime properties
+                        to store. It will be called with two arguments: locally
+                        modified runtime properties, and runtime properties
+                        refetched from storage. If the update raises a
+                        version conflict error (due to concurrent writes),
+                        the function will be called again, with the same
+                        locally modified runtime properties, and the newest
+                        runtime properties from storage.
+        :type on_conflict: function(dict, dict) -> dict
         """
-        if self._node_instance is not None and self._node_instance.dirty:
-            self._endpoint.update_node_instance(self._node_instance)
-            self._node_instance = None
+        if on_conflict is not None:
+            # copy the locally modified runtime properties so that we can pass
+            # the same "before" state to each on_conflict invocation
+            props = self.runtime_properties.copy()
+
+            # Don't refetch yet - assume that the freshest version in storage
+            # is the same that we have (optimistic concurrency control)
+            latest_props = props
+
+            while True:
+                self.runtime_properties = on_conflict(props, latest_props)
+
+                try:
+                    self._endpoint.update_node_instance(self._node_instance)
+                except CloudifyClientError as e:
+                    if e.status_code != 409:
+                        raise
+                    # storage has a newer version of the node instance:
+                    # let's fetch it and update our copy
+                    self.refresh(force=True)
+                    latest_props = self.runtime_properties.copy()
+                else:
+                    break
+        else:
+            if self._node_instance is not None and self._node_instance.dirty:
+                self._endpoint.update_node_instance(self._node_instance)
+        self._node_instance = None
+
+    def refresh(self, force=False):
+        """Force fetching up-to-date instance data.
+
+        Useful for scripts that must reliably work in parallel, with each
+        updating runtime properties.
+
+        :param force: Overwrite local changes
+        """
+        if not force and self._node_instance and self._node_instance.dirty:
+            raise exceptions.NonRecoverableError(
+                'runtime_properties are dirty: refreshing now would destroy '
+                'local changes')
+        self._get_node_instance()
 
     def _get_node_instance_ip_if_needed(self):
         self._get_node_instance_if_needed()
@@ -470,6 +522,7 @@ class RelationshipSubjectContext(object):
 
 
 class CloudifyContext(CommonContext):
+
     """
     A context object passed to plugins tasks invocations.
     The context object is used in plugins when interacting with
@@ -632,6 +685,11 @@ class CloudifyContext(CommonContext):
         return self._context.get('workflow_id')
 
     @property
+    def rest_token(self):
+        """REST service token"""
+        return self._context.get('rest_token')
+
+    @property
     def task_id(self):
         """The plugin's task invocation unique id."""
         return self._context.get('task_id')
@@ -733,8 +791,9 @@ class CloudifyContext(CommonContext):
                               uploaded.
         """
 
-        return self._endpoint.get_blueprint_resource(
+        return self._endpoint.get_resource(
             blueprint_id=self.blueprint.id,
+            deployment_id=self.deployment.id,
             resource_path=resource_path)
 
     def get_resource_and_render(self,
@@ -751,8 +810,9 @@ class CloudifyContext(CommonContext):
 
         template_variables = self._add_context_to_template_variables(
             template_variables)
-        return self._endpoint.get_blueprint_resource(
+        return self._endpoint.get_resource(
             blueprint_id=self.blueprint.id,
+            deployment_id=self.deployment.id,
             resource_path=resource_path,
             template_variables=template_variables)
 
@@ -785,8 +845,9 @@ class CloudifyContext(CommonContext):
 
         """
 
-        return self._endpoint.download_blueprint_resource(
+        return self._endpoint.download_resource(
             blueprint_id=self.blueprint.id,
+            deployment_id=self.deployment.id,
             resource_path=resource_path,
             logger=self.logger,
             target_path=target_path)
@@ -807,8 +868,9 @@ class CloudifyContext(CommonContext):
 
         template_variables = self._add_context_to_template_variables(
             template_variables)
-        return self._endpoint.download_blueprint_resource(
+        return self._endpoint.download_resource(
             blueprint_id=self.blueprint.id,
+            deployment_id=self.deployment.id,
             resource_path=resource_path,
             logger=self.logger,
             target_path=target_path,

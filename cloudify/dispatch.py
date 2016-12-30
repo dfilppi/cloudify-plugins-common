@@ -27,8 +27,10 @@ import threading
 import traceback
 import StringIO
 import Queue
+from time import sleep
 
 from cloudify_rest_client.executions import Execution
+from cloudify_rest_client.exceptions import InvalidExecutionUpdateStatus
 
 from cloudify import logs
 from cloudify import exceptions
@@ -36,10 +38,12 @@ from cloudify import state
 from cloudify import context
 from cloudify import utils
 from cloudify import amqp_client_utils
+from cloudify import constants
 from cloudify.amqp_client_utils import AMQPWrappedThread
 from cloudify.manager import update_execution_status, get_rest_client
 from cloudify.workflows import workflow_context
 from cloudify.workflows import api
+from cloudify.constants import LOGGING_CONFIG_FILE
 
 CLOUDIFY_DISPATCH = 'CLOUDIFY_DISPATCH'
 
@@ -75,7 +79,7 @@ except ImportError:
 SYSTEM_DEPLOYMENT = '__system__'
 PLUGINS_DIR = os.path.join(VIRTUALENV, 'plugins')
 DISPATCH_LOGGER_FORMATTER = logging.Formatter(
-    '%(asctime)s [%(levelname)s] %(message)s')
+    '%(asctime)s [%(name)s] %(levelname)s: %(message)s')
 
 
 class TaskHandler(object):
@@ -143,21 +147,31 @@ class TaskHandler(object):
                 return dispatch_output['payload']
             elif dispatch_output['type'] == 'error':
                 error = dispatch_output['payload']
-                # message = payload['message']
-                # TODO: handle traceback, can't really serialize
-                # the traceback, as it may include frames that are not in the
-                # current python path and adding it to the message will be very
-                # verbose
+
                 tb = error['traceback']
-                message = tb
+                exception_type = error['exception_type']
+                message = error['message']
+
+                known_exception_type_kwargs = error[
+                    'known_exception_type_kwargs']
+                causes = known_exception_type_kwargs.pop('causes', [])
+                causes.append({
+                    'message': message,
+                    'type': exception_type,
+                    'traceback': tb
+                })
+                known_exception_type_kwargs['causes'] = causes
+
                 known_exception_type = getattr(exceptions,
                                                error['known_exception_type'])
                 known_exception_type_args = error['known_exception_type_args']
+
                 if error['append_message']:
                     known_exception_type_args.append(message)
                 else:
                     known_exception_type_args.insert(0, message)
-                raise known_exception_type(*known_exception_type_args)
+                raise known_exception_type(*known_exception_type_args,
+                                           **known_exception_type_kwargs)
             else:
                 raise exceptions.NonRecoverableError(
                     'Unexpected output type: {0}'
@@ -216,6 +230,9 @@ class TaskHandler(object):
                 os.pathsep,
                 env.get('PYTHONPATH', ''))
 
+        if self.cloudify_context.get('bypass_maintenance'):
+            env[constants.BYPASS_MAINTENANCE] = 'True'
+
         return env
 
     def _extract_plugin_dir(self):
@@ -259,6 +276,22 @@ class TaskHandler(object):
         logger.handlers = []
         logger.addHandler(handler)
         logger.setLevel(logging.DEBUG)
+        self._update_logging_level()
+
+    @staticmethod
+    def _update_logging_level():
+        if not os.path.isfile(LOGGING_CONFIG_FILE):
+            return
+        with open(LOGGING_CONFIG_FILE, 'r') as config_file:
+            config_lines = config_file.readlines()
+        for line in config_lines:
+            if not line.strip() or line.startswith('#'):
+                continue
+            level_name, logger_name = line.split()
+            level_id = logging.getLevelName(level_name.upper())
+            if not isinstance(level_id, int):
+                continue
+            logging.getLogger(logger_name).setLevel(level_id)
 
     def _create_fallback_logger(self, handler_context):
         log_dir = None
@@ -341,65 +374,58 @@ class OperationHandler(TaskHandler):
             # task is local (not through celery) so we need clone kwarg
             # and an amqp client is not required
             kwargs = copy.deepcopy(kwargs)
-        if self.cloudify_context.get('has_intrinsic_functions') is True:
-            kwargs = ctx._endpoint.evaluate_functions(payload=kwargs)
+
+        if self.cloudify_context.get('has_intrinsic_functions'):
+            with state.current_ctx.push(ctx, kwargs):
+                kwargs = ctx._endpoint.evaluate_functions(payload=kwargs)
+
         if not self.cloudify_context.get('no_ctx_kwarg'):
             kwargs['ctx'] = ctx
-        state.current_ctx.set(ctx, kwargs)
-        try:
-            result = self.func(*self.args, **kwargs)
-        except:
-            ctx.logger.error(
-                'Exception raised on operation [%s] invocation',
-                ctx.task_name, exc_info=True)
-            raise
-        finally:
-            amqp_client_utils.close_amqp_client()
-            state.current_ctx.clear()
-            if ctx.type == context.NODE_INSTANCE:
-                ctx.instance.update()
-            elif ctx.type == context.RELATIONSHIP_INSTANCE:
-                ctx.source.instance.update()
-                ctx.target.instance.update()
+
+        with state.current_ctx.push(ctx, kwargs):
+            try:
+                result = self.func(*self.args, **kwargs)
+            finally:
+                amqp_client_utils.close_amqp_client()
+                if ctx.type == context.NODE_INSTANCE:
+                    ctx.instance.update()
+                elif ctx.type == context.RELATIONSHIP_INSTANCE:
+                    ctx.source.instance.update()
+                    ctx.target.instance.update()
+
         if ctx.operation._operation_retry:
             raise ctx.operation._operation_retry
         return result
 
 
 class WorkflowHandler(TaskHandler):
-
     @property
     def ctx_cls(self):
         if getattr(self.func, 'workflow_system_wide', False):
             return workflow_context.CloudifySystemWideWorkflowContext
-        else:
-            return workflow_context.CloudifyWorkflowContext
+        return workflow_context.CloudifyWorkflowContext
 
     def handle(self):
         if not self.func:
-            raise exceptions.NonRecoverableError('func not found: {0}'.
-                                                 format(self.cloudify_context))
+            raise exceptions.NonRecoverableError(
+                'func not found: {0}'.format(self.cloudify_context))
+
         self.kwargs['ctx'] = self.ctx
-        if self.ctx.local:
-            handler = self._handle_local_workflow
-        else:
-            handler = self._handle_remote_workflow
-        return handler()
+
+        with state.current_workflow_ctx.push(self.ctx, self.kwargs):
+            if self.ctx.local:
+                return self._handle_local_workflow()
+            return self._handle_remote_workflow()
 
     def _handle_remote_workflow(self):
         rest = get_rest_client()
         amqp_client_utils.init_amqp_client()
         try:
-            execution = rest.executions.get(self.ctx.execution_id,
-                                            _include=['status'])
-            if execution.status in (Execution.CANCELLING,
-                                    Execution.FORCE_CANCELLING):
-                # execution has been requested to be cancelled before it was
-                # even started
+            try:
+                self._workflow_started()
+            except InvalidExecutionUpdateStatus:
                 self._workflow_cancelled()
                 return api.EXECUTION_CANCELLED_RESULT
-
-            self._workflow_started()
 
             queue = Queue.Queue()
             t = AMQPWrappedThread(target=self._remote_workflow_child_thread,
@@ -464,23 +490,24 @@ class WorkflowHandler(TaskHandler):
         # the actual execution of the workflow will run in another thread.
         # this method is the entry point for that thread, and takes care of
         # forwarding the result or error back to the parent thread
-        try:
-            self.ctx.internal.start_event_monitor()
-            workflow_result = self._execute_workflow_function()
-            queue.put({'result': workflow_result})
-        except api.ExecutionCancelled:
-            queue.put({'result': api.EXECUTION_CANCELLED_RESULT})
-        except BaseException as workflow_ex:
-            tb = StringIO.StringIO()
-            traceback.print_exc(file=tb)
-            err = {
-                'type': type(workflow_ex).__name__,
-                'message': str(workflow_ex),
-                'traceback': tb.getvalue()
-            }
-            queue.put({'error': err})
-        finally:
-            self.ctx.internal.stop_event_monitor()
+        with state.current_workflow_ctx.push(self.ctx, self.kwargs):
+            try:
+                self.ctx.internal.start_event_monitor()
+                workflow_result = self._execute_workflow_function()
+                queue.put({'result': workflow_result})
+            except api.ExecutionCancelled:
+                queue.put({'result': api.EXECUTION_CANCELLED_RESULT})
+            except BaseException as workflow_ex:
+                tb = StringIO.StringIO()
+                traceback.print_exc(file=tb)
+                err = {
+                    'type': type(workflow_ex).__name__,
+                    'message': str(workflow_ex),
+                    'traceback': tb.getvalue()
+                }
+                queue.put({'error': err})
+            finally:
+                self.ctx.internal.stop_event_monitor()
 
     def _handle_local_workflow(self):
         try:
@@ -497,7 +524,6 @@ class WorkflowHandler(TaskHandler):
     def _execute_workflow_function(self):
         try:
             self.ctx.internal.start_local_tasks_processing()
-            state.current_workflow_ctx.set(self.ctx, self.kwargs)
             result = self.func(*self.args, **self.kwargs)
             if not self.ctx.internal.graph_mode:
                 tasks = list(self.ctx.internal.task_graph.tasks_iter())
@@ -506,7 +532,6 @@ class WorkflowHandler(TaskHandler):
             return result
         finally:
             self.ctx.internal.stop_local_tasks_processing()
-            state.current_workflow_ctx.clear()
 
     def _workflow_started(self):
         self._update_execution_status(Execution.STARTED)
@@ -538,8 +563,21 @@ class WorkflowHandler(TaskHandler):
                 self.ctx.workflow_id))
 
     def _update_execution_status(self, status, error=None):
-        if not self.ctx.local:
-            update_execution_status(self.ctx.execution_id, status, error)
+        if self.ctx.local:
+            return
+        while True:
+            try:
+                return update_execution_status(
+                    self.ctx.execution_id, status, error)
+            except InvalidExecutionUpdateStatus as exc:
+                self.ctx.logger.exception(
+                    'update execution status is invalid: {0}'.format(exc))
+                raise
+            except Exception as exc:
+                self.ctx.logger.exception(
+                    'update execution status got unexpected rest error: {0}'
+                    .format(exc))
+            sleep(5)
 
 
 TASK_HANDLERS = {
@@ -610,6 +648,11 @@ def main():
             # convert pure user exceptions to a RecoverableError
             known_exception_type = exceptions.RecoverableError
 
+        try:
+            causes = e.causes
+        except AttributeError:
+            causes = []
+
         payload_type = 'error'
         payload = {
             'traceback': trace_out,
@@ -617,8 +660,16 @@ def main():
             'message': str(e),
             'known_exception_type': known_exception_type.__name__,
             'known_exception_type_args': known_exception_type_args,
+            'known_exception_type_kwargs': {'causes': causes or []},
             'append_message': append_message,
         }
+
+        logger = logging.getLogger(__name__)
+        logger.error('Task {0}[{1}] raised:\n{2}'.format(
+            handler.cloudify_context['task_name'],
+            handler.cloudify_context.get('task_id', '<no-id>'),
+            trace_out))
+
     finally:
         if handler:
             handler.close()
